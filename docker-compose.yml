@@ -1,0 +1,23 @@
+version: '3.9'
+
+services:
+  webcrawler_gui:
+    build: .
+    container_name: webcrawler_gui
+    ports:
+      - "8501:8501"
+    volumes:
+      - webcrawler_data:/app/output
+    restart: unless-stopped
+    command: streamlit run crawler_gui.py --server.port=8501 --server.enableCORS=false
+
+  webcrawler_cli:
+    build: .
+    container_name: webcrawler_cli
+    entrypoint: ["python", "crawler_cli.py", "https://example.com", "AI,robots", "-n", "30", "-t", "6", "-o", "output/scan.csv"]
+    volumes:
+      - webcrawler_data:/app/output
+    restart: "no"
+
+volumes:
+  webcrawler_data:
