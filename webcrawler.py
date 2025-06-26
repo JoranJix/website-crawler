@@ -2,12 +2,13 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import socket
-import argparse
 import threading
 import queue
 import time
 import csv
-import urllib.robotparser
+import os
+
+DOCUMENT_EXTENSIONS = [".pdf", ".txt", ".json", ".doc", ".docx", ".csv", ".xls", ".xlsx", ".ppt", ".pptx", ".html", ".htm"]
 
 def scan_ports(ip, ports, timeout=1.0):
     open_ports = []
@@ -19,8 +20,21 @@ def scan_ports(ip, ports, timeout=1.0):
             continue
     return open_ports
 
+def extract_filename_from_url(url):
+    return os.path.basename(urlparse(url).path)
+
+def fetch_text_from_file(url, filetype, timeout=5):
+    try:
+        r = requests.get(url, timeout=timeout)
+        if filetype in [".txt", ".json"]:
+            return r.text[:5000].strip()
+    except:
+        return ""
+    return ""
+
 class Crawler:
-    def __init__(self, start_url, keyword, max_pages=20, num_threads=5, enable_portscan=False, ports_to_scan=None):
+    def __init__(self, start_url, keyword, max_pages=20, num_threads=5,
+                 enable_portscan=False, ports_to_scan=None):
         self.start_url = start_url
         self.keyword = keyword.lower()
         self.max_pages = max_pages
@@ -32,7 +46,8 @@ class Crawler:
         self.to_visit.put(start_url)
         self.lock = threading.Lock()
         self.results = []
-        self.rp_cache = {}
+        self.active_thread_objects = []
+        self.active_threads = 0
 
     def get_ip(self, url):
         try:
@@ -41,71 +56,92 @@ class Crawler:
             return "Unresolvable"
 
     def obey_robots(self, url):
-        domain = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-        if domain in self.rp_cache:
-            rp = self.rp_cache[domain]
-        else:
-            rp = urllib.robotparser.RobotFileParser()
-            rp.set_url(urljoin(domain, "/robots.txt"))
-            try:
-                rp.read()
-            except:
-                rp = None
-            self.rp_cache[domain] = rp
-        return rp and rp.can_fetch("*", url)
+        return True  # Ignoring robots.txt on purpose
 
     def crawl_page(self):
-        while len(self.visited) < self.max_pages and not self.to_visit.empty():
-            url = self.to_visit.get()
-            with self.lock:
-                if url in self.visited:
-                    continue
-                self.visited.add(url)
-
-            if not self.obey_robots(url):
-                continue
-
-            try:
-                response = requests.get(url, timeout=6)
-                soup = BeautifulSoup(response.text, "html.parser")
-                text = soup.get_text().lower()
-                fulltext = ' '.join(text.split())
-            except:
-                continue
-
-            if self.keyword in text:
-                title = soup.title.string.strip() if soup.title else "No Title"
-                ip = self.get_ip(url)
-                if self.enable_portscan and ip not in ("Unresolvable", "Nicht auflösbar"):
-                    open_ports = scan_ports(ip, self.ports_to_scan)
-                    ports_str = ", ".join(str(p) for p in open_ports) if open_ports else "None"
-                else:
-                    ports_str = "Not Scanned"
-
+        with self.lock:
+            self.active_threads += 1
+        try:
+            while len(self.visited) < self.max_pages and not self.to_visit.empty():
+                url = self.to_visit.get()
                 with self.lock:
-                    self.results.append({
-                        "title": title,
-                        "url": url,
-                        "ip": ip,
-                        "keyword": self.keyword,
-                        "fulltext": fulltext,
-                        "open_ports": ports_str
-                    })
+                    if url in self.visited:
+                        continue
+                    self.visited.add(url)
 
-            for tag in soup.find_all("a", href=True):
-                next_url = urljoin(url, tag['href'])
-                if next_url.startswith("http") and urlparse(next_url).netloc:
+                if not self.obey_robots(url):
+                    continue
+
+                try:
+                    response = requests.get(url, timeout=6)
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    text = soup.get_text().lower()
+                    fulltext = ' '.join(text.split())
+                except:
+                    continue
+
+                if self.keyword in text:
+                    title = soup.title.string.strip() if soup.title else "No Title"
+                    ip = self.get_ip(url)
+                    ports_str = "Not Scanned"
+                    if self.enable_portscan and ip != "Unresolvable":
+                        open_ports = scan_ports(ip, self.ports_to_scan)
+                        ports_str = ", ".join(str(p) for p in open_ports) if open_ports else "None"
+                    preview = fulltext[:300] + "..." if len(fulltext) > 300 else fulltext
                     with self.lock:
-                        if next_url not in self.visited:
-                            self.to_visit.put(next_url)
+                        self.results.append({
+                            "title": title,
+                            "url": url,
+                            "ip": ip,
+                            "keyword": self.keyword,
+                            "fulltext": fulltext,
+                            "open_ports": ports_str,
+                            "file_url": "",
+                            "file_name": "",
+                            "file_type": "",
+                            "matched_content": "",
+                            "preview": preview
+                        })
+
+                for tag in soup.find_all("a", href=True):
+                    href = tag["href"]
+                    next_url = urljoin(url, href)
+                    if next_url.startswith("http") and urlparse(next_url).netloc:
+                        ext = os.path.splitext(urlparse(next_url).path)[1].lower()
+                        if ext in DOCUMENT_EXTENSIONS:
+                            filename = extract_filename_from_url(next_url)
+                            filetext = fetch_text_from_file(next_url, ext)
+                            if self.keyword in filetext.lower():
+                                preview = filetext[:300] + "..." if len(filetext) > 300 else filetext
+                                with self.lock:
+                                    self.results.append({
+                                        "title": "Linked File",
+                                        "url": url,
+                                        "ip": self.get_ip(url),
+                                        "keyword": self.keyword,
+                                        "fulltext": "",
+                                        "open_ports": "",
+                                        "file_url": next_url,
+                                        "file_name": filename,
+                                        "file_type": ext.lstrip("."),
+                                        "matched_content": filetext[:1000],
+                                        "preview": preview
+                                    })
+                        else:
+                            with self.lock:
+                                if next_url not in self.visited:
+                                    self.to_visit.put(next_url)
+        finally:
+            with self.lock:
+                self.active_threads -= 1
 
     def run(self):
-        threads = []
+        self.active_thread_objects = []
         for _ in range(self.num_threads):
             t = threading.Thread(target=self.crawl_page)
             t.start()
-            threads.append(t)
-        for t in threads:
+            self.active_thread_objects.append(t)
+        for t in self.active_thread_objects:
             t.join()
         return self.results
 
